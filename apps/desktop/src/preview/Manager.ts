@@ -112,7 +112,8 @@ const MAX_SCREENSHOT_WIDTH = 1280;
 /** How long an armed tab keeps the exclusive display-media slot before another tab may take it. */
 const RECORDING_ARM_GRACE_MS = 10_000;
 const PICTURE_IN_PICTURE_FRAME_INTERVAL_MS = Math.ceil(1_000 / 12);
-const PICTURE_IN_PICTURE_JPEG_QUALITY = 90;
+const PICTURE_IN_PICTURE_JPEG_QUALITY = 80;
+const PICTURE_IN_PICTURE_JPEG_QUALITY_ENLARGED = 90;
 const PICTURE_IN_PICTURE_INITIAL_WIDTH = 480;
 const PICTURE_IN_PICTURE_INITIAL_HEIGHT = 320;
 const PICTURE_IN_PICTURE_MIN_WIDTH = 240;
@@ -192,6 +193,11 @@ export const fitPictureInPictureContentSize = (
   height *= minimumScale;
   return [Math.round(width), Math.round(height)];
 };
+
+// Sharper frames only while the PiP window is enlarged; the small window keeps
+// the cheaper default so idle streaming cost does not change.
+export const pictureInPictureJPEGQuality = (isEnlarged: boolean): number =>
+  isEnlarged ? PICTURE_IN_PICTURE_JPEG_QUALITY_ENLARGED : PICTURE_IN_PICTURE_JPEG_QUALITY;
 
 export const recordingFileExtension = (mimeType: string): string => {
   const subtype = mimeType.split(";", 1)[0]?.trim().toLowerCase().split("/")[1] ?? "";
@@ -2709,16 +2715,57 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     ) {
       return;
     }
+    const pipWindow = (yield* SynchronizedRef.get(pictureInPictureSessionsRef)).get(tabId)?.window;
+    // A maximized or fullscreen PiP window is OS-sized, so aspect-fit resizes must
+    // not fight it; frames stay sharp while enlarged via the higher JPEG quality.
+    const pictureInPictureEnlarged =
+      pipWindow !== undefined &&
+      !pipWindow.isDestroyed() &&
+      (pipWindow.isMaximized?.() === true || pipWindow.isFullScreen?.() === true);
     const encoded = yield* attempt(
       {
         operation: "frameCapture.encodeFrame",
         tabId,
         webContentsId: wc.id,
       },
-      () => image.toJPEG(PICTURE_IN_PICTURE_JPEG_QUALITY),
+      () => image.toJPEG(pictureInPictureJPEGQuality(pictureInPictureEnlarged)),
     );
     const frameSession = (yield* SynchronizedRef.get(frameCaptureSessionsRef)).get(tabId);
     if (frameSession?.scope !== captureSession.scope) return;
+    // Track the source aspect on every capture so a ratio change while enlarged is
+    // applied on restore even when later frames are byte-identical. The stored
+    // ratio is only updated alongside an apply, keeping it equal to the OS lock.
+    if (pipWindow !== undefined && !pipWindow.isDestroyed()) {
+      const previousAspectRatio = (yield* Ref.get(pictureInPictureAspectRatiosRef)).get(tabId);
+      const aspectRatio = size.width / size.height;
+      if (
+        !pictureInPictureEnlarged &&
+        (previousAspectRatio === undefined ||
+          Math.abs(previousAspectRatio - aspectRatio) > PICTURE_IN_PICTURE_ASPECT_RATIO_EPSILON)
+      ) {
+        yield* attempt(
+          {
+            operation: "pictureInPicture.setAspectRatio",
+            tabId,
+            webContentsId: wc.id,
+          },
+          () => {
+            const contentSize = fitPictureInPictureContentSize(
+              pipWindow.getContentSize(),
+              aspectRatio,
+            );
+            pipWindow.setAspectRatio(0);
+            pipWindow.setContentSize(contentSize[0], contentSize[1], false);
+            pipWindow.setAspectRatio(aspectRatio);
+          },
+        );
+        yield* Ref.update(pictureInPictureAspectRatiosRef, (aspectRatios) =>
+          replaceMap(aspectRatios, (copy) => {
+            copy.set(tabId, aspectRatio);
+          }),
+        );
+      }
+    }
     const pictureInPicture =
       frameSession.consumers.has("picture-in-picture") &&
       frameSession.lastPictureInPictureFrame?.equals(encoded) !== true;
@@ -2739,41 +2786,6 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       if (pictureInPictureWindow && !pictureInPictureWindow.isDestroyed()) {
         deliveries.push(
           Effect.gen(function* () {
-            const previousAspectRatio = (yield* Ref.get(pictureInPictureAspectRatiosRef)).get(
-              tabId,
-            );
-            const aspectRatio = frame.width / frame.height;
-            const isEnlarged =
-              pictureInPictureWindow.isMaximized?.() === true ||
-              pictureInPictureWindow.isFullScreen?.() === true;
-            if (
-              !isEnlarged &&
-              (previousAspectRatio === undefined ||
-                Math.abs(previousAspectRatio - aspectRatio) >
-                  PICTURE_IN_PICTURE_ASPECT_RATIO_EPSILON)
-            ) {
-              yield* attempt(
-                {
-                  operation: "pictureInPicture.setAspectRatio",
-                  tabId,
-                  webContentsId: wc.id,
-                },
-                () => {
-                  const contentSize = fitPictureInPictureContentSize(
-                    pictureInPictureWindow.getContentSize(),
-                    aspectRatio,
-                  );
-                  pictureInPictureWindow.setAspectRatio(0);
-                  pictureInPictureWindow.setContentSize(contentSize[0], contentSize[1], false);
-                  pictureInPictureWindow.setAspectRatio(aspectRatio);
-                },
-              );
-              yield* Ref.update(pictureInPictureAspectRatiosRef, (aspectRatios) =>
-                replaceMap(aspectRatios, (copy) => {
-                  copy.set(tabId, aspectRatio);
-                }),
-              );
-            }
             yield* attempt(
               {
                 operation: "pictureInPicture.deliverFrame",

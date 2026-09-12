@@ -37,6 +37,13 @@ describe("fitPictureInPictureContentSize", () => {
   });
 });
 
+describe("pictureInPictureJPEGQuality", () => {
+  it("streams sharper frames only while the PiP window is enlarged", () => {
+    expect(PreviewManager.pictureInPictureJPEGQuality(false)).toBe(80);
+    expect(PreviewManager.pictureInPictureJPEGQuality(true)).toBe(90);
+  });
+});
+
 describe("recordingFileExtension", () => {
   it("derives the artifact extension from the recorder's actual mime type", () => {
     expect(PreviewManager.recordingFileExtension("video/mp4;codecs=avc1.640028")).toBe("mp4");
@@ -2675,6 +2682,8 @@ describe("PreviewManager", () => {
             alwaysOnTop: true,
             show: false,
             skipTaskbar: true,
+            fullscreenable: true,
+            maximizable: true,
             webPreferences: expect.objectContaining({
               preload: "/tmp/t3/desktop/preview-pip-preload.cjs",
               backgroundThrottling: false,
@@ -2734,6 +2743,59 @@ describe("PreviewManager", () => {
         const capturesAfterClose = capturePage.mock.calls.length;
         yield* TestClock.adjust(200);
         expect(capturePage).toHaveBeenCalledTimes(capturesAfterClose);
+      }),
+    ),
+  );
+
+  effectIt.effect("keeps an enlarged PiP window enlarged and reapplies aspect on restore", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const jpegWide = Buffer.from("pip-frame-1280x720");
+        const jpegTall = Buffer.from("pip-frame-640x480");
+        let size = { width: 1280, height: 720 };
+        let bytes = jpegWide;
+        const toJPEG = vi.fn((_quality?: number) => bytes);
+        const capturePage = vi.fn(async () => ({
+          toJPEG,
+          getSize: () => ({ ...size }),
+        }));
+        fromId.mockReturnValue(makeTestPreviewWebContents(capturePage));
+        let maximized = false;
+        const { pictureInPictureWindow, send } = makeTestPictureInPictureWindow();
+        Object.assign(pictureInPictureWindow, {
+          isMaximized: vi.fn(() => maximized),
+          isFullScreen: vi.fn(() => false),
+        });
+        browserWindowConstructor.mockImplementation(function () {
+          return pictureInPictureWindow;
+        });
+
+        yield* manager.createTab("tab_pip_enlarged");
+        yield* manager.registerWebview("tab_pip_enlarged", 42);
+        yield* manager.openPictureInPicture("tab_pip_enlarged");
+
+        expect(toJPEG.mock.calls.at(-1)).toEqual([80]);
+        expect(pictureInPictureWindow.setAspectRatio.mock.calls).toEqual([[0], [1280 / 720]]);
+        const contentSizesAfterOpen = pictureInPictureWindow.setContentSize.mock.calls.length;
+
+        maximized = true;
+        size = { width: 640, height: 480 };
+        bytes = jpegTall;
+        yield* TestClock.adjust(100);
+
+        expect(toJPEG.mock.calls.at(-1)).toEqual([90]);
+        expect(send).toHaveBeenCalledTimes(2);
+        expect(pictureInPictureWindow.setContentSize.mock.calls.length).toBe(contentSizesAfterOpen);
+
+        maximized = false;
+        yield* TestClock.adjust(100);
+
+        expect(toJPEG.mock.calls.at(-1)).toEqual([80]);
+        expect(pictureInPictureWindow.setContentSize.mock.calls.length).toBe(
+          contentSizesAfterOpen + 1,
+        );
+        expect(pictureInPictureWindow.setAspectRatio.mock.calls.at(-1)).toEqual([640 / 480]);
+        yield* manager.closePictureInPicture("tab_pip_enlarged");
       }),
     ),
   );
